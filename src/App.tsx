@@ -1,123 +1,250 @@
-import { useState, useEffect } from "react";
-import { WorkflowDiagram } from "./components/WorkflowDiagram";
-import { CodeDisplay } from "./components/CodeDisplay";
-import { BackgroundDots } from "./components/BackgroundDots";
-import { useWorkflowWebSocket } from "./hooks/useWorkflowWebSocket";
-import { WORKFLOW_STEPS } from "./types";
+import { createAI } from "agents/models/ai-sdk";
+import { callable, routeAgentRequest, type Schedule } from "agents";
+import { getSchedulePrompt, scheduleSchema } from "agents/schedule";
+import { AIChatAgent, type OnChatMessageOptions } from "@cloudflare/ai-chat";
+import {
+  convertToModelMessages,
+  pruneMessages,
+  stepCountIs,
+  streamText,
+  tool
+} from "ai";
+import { z } from "zod";
 
-function App() {
-	const [instanceId, setInstanceId] = useState<string | null>(null);
-	const [isStarting, setIsStarting] = useState(false);
-	const workflowState = useWorkflowWebSocket(instanceId);
+export class ChatAgent extends AIChatAgent<Env> {
+  maxPersistedMessages = 100;
+  chatRecovery = true as const;
+  // Wait for MCP connections to be re-established after hibernation before
+  // processing a message, so MCP tools aren't intermittently missing.
+  waitForMcpConnections = true;
 
-	useEffect(() => {
-		if (workflowState.workflowStatus === "completed") {
-			const timer = setTimeout(() => {
-				setInstanceId(null);
-			}, 1500);
-			return () => clearTimeout(timer);
-		}
-	}, [workflowState.workflowStatus]);
+  onStart() {
+    // Configure OAuth popup behavior for MCP servers that require authentication
+    this.mcp.configureOAuthCallback({
+      customHandler: (result) => {
+        if (result.authSuccess) {
+          return new Response("<script>window.close();</script>", {
+            headers: { "content-type": "text/html" },
+            status: 200
+          });
+        }
+        return new Response(
+          `Authentication Failed: ${result.authError || "Unknown error"}`,
+          { headers: { "content-type": "text/plain" }, status: 400 }
+        );
+      }
+    });
+  }
 
-	useEffect(() => {
-		if (
-			workflowState.workflowStatus === "running" &&
-			workflowState.currentStep
-		) {
-			setIsStarting(false);
-		}
-	}, [workflowState.workflowStatus, workflowState.currentStep]);
+  @callable()
+  async addServer(name: string, url: string) {
+    return await this.addMcpServer(name, url);
+  }
 
-	const handleStartWorkflow = async () => {
-		setIsStarting(true);
+  @callable()
+  async removeServer(serverId: string) {
+    await this.removeMcpServer(serverId);
+  }
 
-		try {
-			const response = await fetch("/api/workflow/start", {
-				method: "POST",
-			});
+  async onChatMessage(_onFinish: unknown, options?: OnChatMessageOptions) {
+    const mcpTools = this.mcp.getAITools();
+    const ai = createAI({ binding: this.env.AI });
 
-			if (!response.ok) {
-				throw new Error("Failed to start workflow");
-			}
+    const result = streamText({
+      // Use the ai function returned by createAI with the model identifier
+      // Llama 3.3 70B (supports tool calling)
+      // @cf/meta/llama-3.3-70b-instruct-fp8-fast
+      // @cf/meta/llama-3.1-8b-instruct
+      model: ai("@cf/meta/llama-4-scout-17b-16e-instruct", {
+        sessionAffinity: this.sessionAffinity
+      }),
+      system: `You are a helpful assistant that can understand images. You can check the weather, get the user's timezone, run calculations, and schedule tasks. When users share images, describe what you see and answer questions about them.
 
-			const data = await response.json();
-			setInstanceId(data.instanceId);
-		} catch {
-			alert("Failed to start workflow. Please try again.");
-			setIsStarting(false);
-		}
-	};
+${getSchedulePrompt({ date: new Date() })}
 
-	return (
-		<div className="min-h-screen bg-neutral-50/30 dark:bg-neutral-950 flex flex-col relative">
-			{/* Background dots across entire page */}
-			<div className="absolute inset-0 text-neutral-200/50 dark:text-neutral-700/40 overflow-hidden">
-				<BackgroundDots />
-			</div>
+If the user asks to schedule a task, use the schedule tool to schedule the task.`,
+      // Prune old tool calls and reasoning to save tokens on long conversations
+      messages: pruneMessages({
+        messages: await convertToModelMessages(this.messages),
+        toolCalls: "before-last-2-messages",
+        reasoning: "before-last-message"
+      }),
+      // Allow longer responses via Workers AI provider options
+      // providerOptions: {
+      //   workersai: {
+      //     max_tokens: 16384
+      //   }
+      // },
+      toolChoice: "auto",
+      tools: {
+        // MCP tools from connected servers
+        // ...mcpTools,
 
-			{/* Minimal Integrated Header */}
-			<header className="px-6 pt-6 pb-4 relative z-10">
-				<div className="flex items-center justify-between">
-					<div className="flex items-center gap-3">
-						<svg
-							role="img"
-							viewBox="0 0 460 271.2"
-							aria-hidden="true"
-							className="h-5 w-auto opacity-90"
-						>
-							<path
-								fill="#FBAD41"
-								d="M328.6,125.6c-0.8,0-1.5,0.6-1.8,1.4l-4.8,16.7c-2.1,7.2-1.3,13.8,2.2,18.7c3.2,4.5,8.6,7.1,15.1,7.4l26.2,1.6c0.8,0,1.5,0.4,1.9,1c0.4,0.6,0.5,1.5,0.3,2.2c-0.4,1.2-1.6,2.1-2.9,2.2l-27.3,1.6c-14.8,0.7-30.7,12.6-36.3,27.2l-2,5.1c-0.4,1,0.3,2,1.4,2h93.8c1.1,0,2.1-0.7,2.4-1.8c1.6-5.8,2.5-11.9,2.5-18.2c0-37-30.2-67.2-67.3-67.2C330.9,125.5,329.7,125.5,328.6,125.6z"
-							/>
-							<path
-								fill="#F6821F"
-								d="M292.8,204.4c2.1-7.2,1.3-13.8-2.2-18.7c-3.2-4.5-8.6-7.1-15.1-7.4l-123.1-1.6c-0.8,0-1.5-0.4-1.9-1s-0.5-1.4-0.3-2.2c0.4-1.2,1.6-2.1,2.9-2.2l124.2-1.6c14.7-0.7,30.7-12.6,36.3-27.2l7.1-18.5c0.3-0.8,0.4-1.6,0.2-2.4c-8-36.2-40.3-63.2-78.9-63.2c-35.6,0-65.8,23-76.6,54.9c-7-5.2-15.9-8-25.5-7.1c-17.1,1.7-30.8,15.4-32.5,32.5c-0.4,4.4-0.1,8.7,0.9,12.7c-27.9,0.8-50.2,23.6-50.2,51.7c0,2.5,0.2,5,0.5,7.5c0.2,1.2,1.2,2.1,2.4,2.1h227.2c1.3,0,2.5-0.9,2.9-2.2L292.8,204.4z"
-							/>
-						</svg>
-						<div className="w-px h-4 bg-neutral-300/50 dark:bg-neutral-600/50" />
-						<h1 className="text-sm font-medium text-neutral-600 dark:text-neutral-400">
-							Workflows Starter Template
-						</h1>
-					</div>
+        // Server-side tool: runs automatically on the server
+        getWeather: tool({
+          type: "function",
+          description:
+            "Get the current weather for a city or country from the user's request. Use this when the user asks about the weather.",
+          inputSchema: z.object({
+            city: z.string().describe("City name")
+          }),
+          execute: async ({ city }) => {
+            const conditions = ["sunny", "cloudy", "rainy", "snowy"];
+            const temp = Math.floor(Math.random() * 30) + 5;
+            return {
+              city,
+              temperature: temp,
+              condition:
+                conditions[Math.floor(Math.random() * conditions.length)],
+              unit: "celsius"
+            };
+          }
+        }),
+        // getWeather: tool({
+        //   description: "Get the current weather for a city",
+        //   inputSchema: z.object({
+        //     city: z.string().describe("City name")
+        //   }),
+        //   execute: async ({ city }) => {
+        //     const res = await fetch(`https://api.weather.example/${city}`);
+        //     return res.json();
+        //     // Replace with a real weather API in production
+        //     // const conditions = ["sunny", "cloudy", "rainy", "snowy"];
+        //     // const temp = Math.floor(Math.random() * 30) + 5;
+        //     // return {
+        //     //   city,
+        //     //   temperature: temp,
+        //     //   condition:
+        //     //     conditions[Math.floor(Math.random() * conditions.length)],
+        //     //   unit: "celsius"
+        //     }
+        // }),
 
-					<a
-						href="https://developers.cloudflare.com/workflows"
-						target="_blank"
-						rel="noopener noreferrer"
-						className="text-xs font-medium text-neutral-600 dark:text-neutral-400 hover:text-neutral-900 dark:hover:text-neutral-200 transition-colors"
-					>
-						Documentation →
-					</a>
-				</div>
-			</header>
+        // Client-side tool: no execute function — the browser handles it
+        getUserTimezone: tool({
+          type: "function",
+          description:
+            "Get the user's timezone from their browser. Use this when you need to know the user's local time.",
+          inputSchema: z.object({})
+        }),
 
-			{/* Main content - unified canvas */}
-			<main className="flex-1 flex flex-col lg:flex-row overflow-hidden relative z-10">
-				{/* Left side - Code (responsive width) */}
-				<div className="w-full lg:w-[60%] overflow-hidden px-6 pb-6">
-					<CodeDisplay
-						currentStep={workflowState.currentStep}
-						workflowStatus={workflowState.workflowStatus}
-						onStartWorkflow={handleStartWorkflow}
-						isStarting={isStarting}
-					/>
-				</div>
+        // Approval tool: requires user confirmation before executing
+        calculate: tool({
+          type: "function",
+          description:
+            "Perform a math calculation with two numbers. Requires user approval for large numbers.",
+          inputSchema: z.object({
+            a: z.number().describe("First number"),
+            b: z.number().describe("Second number"),
+            operator: z
+              .enum(["+", "-", "*", "/", "%"])
+              .describe("Arithmetic operator")
+          }),
+          needsApproval: async ({ a, b }) =>
+            Math.abs(a) > 1000 || Math.abs(b) > 1000,
+          execute: async ({ a, b, operator }) => {
+            const ops: Record<string, (x: number, y: number) => number> = {
+              "+": (x, y) => x + y,
+              "-": (x, y) => x - y,
+              "*": (x, y) => x * y,
+              "/": (x, y) => x / y,
+              "%": (x, y) => x % y
+            };
+            if (operator === "/" && b === 0) {
+              return { error: "Division by zero" };
+            }
+            return {
+              expression: `${a} ${operator} ${b}`,
+              result: ops[operator](a, b)
+            };
+          }
+        }),
 
-				{/* Right side - Diagram (responsive width) */}
-				<div className="flex-1 overflow-hidden px-6 lg:pl-8 lg:pr-6 pb-6">
-					<WorkflowDiagram
-						steps={WORKFLOW_STEPS}
-						stepStatuses={workflowState.stepStatuses}
-						currentStep={workflowState.currentStep}
-						instanceId={instanceId}
-						workflowStatus={workflowState.workflowStatus}
-						onStartWorkflow={handleStartWorkflow}
-						isStarting={isStarting}
-					/>
-				</div>
-			</main>
-		</div>
-	);
+        scheduleTask: tool({
+          type: "function",
+          description:
+            "Schedule a task to be executed at a later time. Use this when the user asks to be reminded or wants something done later.",
+          inputSchema: scheduleSchema,
+          execute: async ({ when, description }) => {
+            if (when.type === "no-schedule") {
+              return "Not a valid schedule input";
+            }
+            const input =
+              when.type === "scheduled"
+                ? when.date
+                : when.type === "delayed"
+                  ? when.delayInSeconds
+                  : when.type === "cron"
+                    ? when.cron
+                    : null;
+            if (!input) return "Invalid schedule type";
+            try {
+              this.schedule(input, "executeTask", description, {
+                idempotent: true
+              });
+              return `Task scheduled: "${description}" (${when.type}: ${input})`;
+            } catch (error) {
+              return `Error scheduling task: ${error}`;
+            }
+          }
+        }),
+
+        getScheduledTasks: tool({
+          type: "function",
+          description: "List all tasks that have been scheduled",
+          inputSchema: z.object({}),
+          execute: async () => {
+            const tasks = this.getSchedules();
+            return tasks.length > 0 ? tasks : "No scheduled tasks found.";
+          }
+        }),
+
+        cancelScheduledTask: tool({
+          type: "function",
+          description: "Cancel a scheduled task by its ID",
+          inputSchema: z.object({
+            taskId: z.string().describe("The ID of the task to cancel")
+          }),
+          execute: async ({ taskId }) => {
+            try {
+              this.cancelSchedule(taskId);
+              return `Task ${taskId} cancelled.`;
+            } catch (error) {
+              return `Error cancelling task: ${error}`;
+            }
+          }
+        })
+      },
+      stopWhen: stepCountIs(20),
+      abortSignal: options?.abortSignal
+    });
+
+    return result.toUIMessageStreamResponse();
+  }
+
+  async executeTask(description: string, _task: Schedule<string>) {
+    // Do the actual work here (send email, call API, etc.)
+    console.log(`Executing scheduled task: ${description}`);
+
+    // Notify connected clients via a broadcast event.
+    // We use broadcast() instead of saveMessages() to avoid injecting
+    // into chat history — that would cause the AI to see the notification
+    // as new context and potentially loop.
+    this.broadcast(
+      JSON.stringify({
+        type: "scheduled-task",
+        description,
+        timestamp: new Date().toISOString()
+      })
+    );
+  }
 }
 
-export default App;
+export default {
+  async fetch(request: Request, env: Env) {
+    return (
+      (await routeAgentRequest(request, env)) ||
+      new Response("Not found", { status: 404 })
+    );
+  }
+} satisfies ExportedHandler<Env>;
